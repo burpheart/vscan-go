@@ -1,23 +1,23 @@
 package main
 
 import (
+	"bufio"
+	"errors"
+	"flag"
 	"io"
-	"os"
 	"log"
 	"net"
-	"flag"
-	"sort"
-	"sync"
-	"time"
-	"bufio"
+	"os"
 	"regexp"
-	"errors"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
-	"io/ioutil"
 	"encoding/json"
+	"io/ioutil"
 )
 
 var config Config
@@ -151,6 +151,7 @@ func (m *Match) MatchPattern(response []byte) (matched bool) {
 	return false
 }
 
+// 正则匹配respone成功，取出相应的内容
 func (m *Match) ParseVersionInfo(response []byte) Extras {
 	var extras = Extras{}
 
@@ -252,6 +253,8 @@ type Probe struct {
 	Data     string
 	Protocol string
 
+	DecodedData []byte
+
 	Ports    string
 	SSLPorts string
 
@@ -298,13 +301,12 @@ func isOtherEscapeCode(b []byte) bool {
   e.g.
 	(1) pattern: \0\xffHi
 		decoded: []byte{0, 255, 72, 105} 4len
-
 	(2) pattern: \\0\\xffHI
 		decoded: []byte{92, 0, 92, 120, 102, 102, 72, 105} 8len
-
 	(3) pattern: \x2e\x2a\x3f\x2b\x7b\x7d\x28\x29\x5e\x24\x7c\x5c
 		decodedStr: \.\*\?\+\{\}\(\)\^\$\|\\
- */
+*/
+// 解析探针数据包
 func DecodePattern(s string) ([]byte, error) {
 	sByteOrigin := []byte(s)
 	matchRe := regexp.MustCompile(`\\(x[0-9a-fA-F]{2}|[0-7]{1,3}|[aftnrv])`)
@@ -355,6 +357,7 @@ func DecodePattern(s string) ([]byte, error) {
 	return sByteDec2, nil
 }
 
+// socket发送探测数据包编码
 func DecodeData(s string) ([]byte, error) {
 	sByteOrigin := []byte(s)
 	matchRe := regexp.MustCompile(`\\(x[0-9a-fA-F]{2}|[0-7]{1,3}|[aftnrv])`)
@@ -407,6 +410,7 @@ type Directive struct {
 	DirectiveStr  string
 }
 
+// 解析 Probe 说明字段  Probe TCP RTSPRequest q|OPTIONS / RTSP/1.0\r\n\r\n|
 func (p *Probe) getDirectiveSyntax(data string) (directive Directive) {
 	directive = Directive{}
 
@@ -415,9 +419,9 @@ func (p *Probe) getDirectiveSyntax(data string) (directive Directive) {
 	}
 	blankIndex := strings.Index(data, " ")
 	directiveName := data[:blankIndex]
-	//blankSpace := data[blankIndex: blankIndex+1]
-	Flag := data[blankIndex+1: blankIndex+2]
-	delimiter := data[blankIndex+2: blankIndex+3]
+	//blankSpace := data[blankIndex : blankIndex+1]
+	Flag := data[blankIndex+1 : blankIndex+2]
+	delimiter := data[blankIndex+2 : blankIndex+3]
 	directiveStr := data[blankIndex+3:]
 
 	directive.DirectiveName = directiveName
@@ -425,6 +429,7 @@ func (p *Probe) getDirectiveSyntax(data string) (directive Directive) {
 	directive.Delimiter = delimiter
 	directive.DirectiveStr = directiveStr
 
+	//Debug(blankSpace)
 	return directive
 }
 
@@ -437,7 +442,26 @@ func (p *Probe) getMatch(data string) (match Match, err error) {
 	textSplited := strings.Split(directive.DirectiveStr, directive.Delimiter)
 
 	pattern, versionInfo := textSplited[0], strings.Join(textSplited[1:], "")
-
+	// 修正(?s)(?i)匹配失效的问题
+	if versionInfo != "" {
+		if string(versionInfo[0]) == "s" || string(versionInfo[0]) == "i" {
+			for ix, z := range versionInfo {
+				if string(z) == "s" {
+					pattern = "(?s)" + pattern
+					versionInfo = versionInfo[ix:]
+				}
+				if string(z) == "i" {
+					pattern = "(?i)" + pattern
+					versionInfo = versionInfo[ix:]
+				}
+				if ix == 1 {
+					versionInfo = versionInfo[ix:]
+					break
+				}
+			}
+		}
+	}
+	versionInfo = strings.TrimLeft(versionInfo, " ")
 	patternUnescaped, _ := DecodePattern(pattern)
 	patternUnescapedStr := string([]rune(string(patternUnescaped)))
 	patternCompiled, ok := regexp.Compile(patternUnescapedStr)
@@ -463,6 +487,26 @@ func (p *Probe) getSoftMatch(data string) (softMatch Match, err error) {
 	textSplited := strings.Split(directive.DirectiveStr, directive.Delimiter)
 
 	pattern, versionInfo := textSplited[0], strings.Join(textSplited[1:], "")
+	// 修正(?s)(?i)匹配失效的问题
+	if versionInfo != "" {
+		if string(versionInfo[0]) == "s" || string(versionInfo[0]) == "i" {
+			for ix, z := range versionInfo {
+				if string(z) == "s" {
+					pattern = "(?s)" + pattern
+					versionInfo = versionInfo[ix:]
+				}
+				if string(z) == "i" {
+					pattern = "(?i)" + pattern
+					versionInfo = versionInfo[ix:]
+				}
+				if ix == 1 {
+					versionInfo = versionInfo[ix:]
+					break
+				}
+			}
+		}
+	}
+	versionInfo = strings.TrimLeft(versionInfo, " ")
 	patternUnescaped, _ := DecodePattern(pattern)
 	patternUnescapedStr := string([]rune(string(patternUnescaped)))
 	patternCompiled, ok := regexp.Compile(patternUnescapedStr)
@@ -479,6 +523,7 @@ func (p *Probe) getSoftMatch(data string) (softMatch Match, err error) {
 	return softMatch, nil
 }
 
+// 解析协议的默认端口
 func (p *Probe) parsePorts(data string) {
 	p.Ports = data[len("ports")+1:]
 }
@@ -503,6 +548,7 @@ func (p *Probe) parseFallback(data string) {
 	p.Fallback = data[len("fallback")+1:]
 }
 
+// 解析每段探针probe标识符数据
 func (p *Probe) fromString(data string) error {
 	var err error
 
@@ -510,6 +556,7 @@ func (p *Probe) fromString(data string) error {
 	lines := strings.Split(data, "\n")
 	probeStr := lines[0]
 
+	// 解析探针Probe开头信息
 	p.parseProbeInfo(probeStr)
 
 	var matchs []Match
@@ -567,7 +614,15 @@ func (p *Probe) parseProbeInfo(probeStr string) {
 	directive := p.getDirectiveSyntax(other)
 
 	p.Name = directive.DirectiveName
-	p.Data = strings.Split(directive.DirectiveStr, directive.Delimiter)[0]
+	// 满足TCP NULL q||
+	if directive.DirectiveStr != "|" {
+		p.Data = strings.Split(directive.DirectiveStr, directive.Delimiter)[0]
+	} else {
+		p.Data = ""
+	}
+
+	p.DecodedData, _ = DecodeData(p.Data) //预先解析 减少开销
+	Debug("解析数据: %v\n", p.Data)
 	p.Protocol = strings.ToLower(strings.TrimSpace(proto))
 }
 
@@ -700,11 +755,12 @@ func (v *VScan) parseProbesFromContent(content string) {
 		probe := Probe{}
 		err := probe.fromString(probePart)
 		if err != nil {
-			log.Println(err)
+			Debug(err)
 			continue
 		}
 		probes = append(probes, probe)
 	}
+	Debug(probes)
 	v.Probes = probes
 }
 
@@ -762,6 +818,7 @@ func (v *VScan) Explore(target Target, config *Config) (Result, error) {
 	// 配置仅使用 NULL Probe 进行探测，及不发送任何 Data，只监听端口返回数据
 	if config.NULLProbeOnly {
 		probesUsed = append(probesUsed, v.ProbesMapKName["NULL"])
+		probesUsed = append(probesUsed, v.ProbesMapKName["GenericLines"])
 	} else
 	// 未进行特殊配置，默认只使用 NULL Probe 和包含了探测端口的 Probe 探针组
 	{
@@ -787,138 +844,136 @@ func (v *VScan) Explore(target Target, config *Config) (Result, error) {
 	}
 	probesUsed = probesUsedFiltered
 
+	Debug("probes used:", probesUsed)
+
 	result, err := v.scanWithProbes(target, &probesUsed, config)
 
 	return result, err
 }
 
-func (v *VScan) scanWithProbes(target Target, probes *[]Probe, config *Config) (Result, error) {
+// 探测目标端口函数，返回探测结果和错误信息
+func (v *VScan) getWithProbes(target Target, config *Config, DecodedData []byte, vprobeName string, vprobeData string, vprobeMatchs *[]Match, vprobeProtocol string) (Result, bool, bool, Match, []byte, error) {
 	var result = Result{Target: target}
+	//probeData, _ := DecodeData(stringData) //预处理发送包
+	var found bool
+	var softFound bool
+	found = false
+	softFound = false
+	var softMatch Match
 
-	for _, probe := range *probes {
-		var response []byte
+	Debug("Try Probe(" + vprobeName + ")" + ", Data(" + vprobeData + ")")
+	//response, err := grabResponse(target, probeData, config)
+	response, err := grabResponse(target, DecodedData, config)
+	//发送包并接收响应
+	// 成功获取 Banner 即开始匹配规则，无规则匹配则直接返回
+	if err != nil {
+		Debug(err)
+		return result, found, softFound, softMatch, response, err
+	}
+	if len(response) > 0 {
+		Info("Get response " + strconv.Itoa(len(response)) + " bytes from destination with Probe(" + vprobeName + ")")
+		for _, match := range *vprobeMatchs {
+			matched := match.MatchPattern(response)
+			if matched && !match.IsSoft {
+				extras := match.ParseVersionInfo(response)
 
-		probeData, _ := DecodeData(probe.Data)
+				result.Service.Target = target
 
-		Debug("Try Probe(" + probe.Name + ")" + ", Data(" + probe.Data + ")")
-		response, _ = grabResponse(target, probeData, config)
+				result.Service.Details.ProbeName = vprobeName
+				result.Service.Details.ProbeData = vprobeData
+				result.Service.Details.MatchMatched = match.Pattern
 
-		// 成功获取 Banner 即开始匹配规则，无规则匹配则直接返回
-		if len(response) > 0 {
-			Info("Get response " + strconv.Itoa(len(response)) + " bytes from destination with Probe(" + probe.Name + ")")
-			found := false
+				result.Service.Protocol = strings.ToLower(vprobeProtocol)
+				result.Service.Name = match.Service
 
-			softFound := false
-			var softMatch Match
+				result.Banner = string(response)
+				result.BannerBytes = response
+				result.Service.Extras = extras
 
-			for _, match := range *probe.Matchs {
-				matched := match.MatchPattern(response)
-				if matched && !match.IsSoft {
-					extras := match.ParseVersionInfo(response)
+				result.Timestamp = int32(time.Now().Unix())
 
-					result.Service.Target = target
+				found = true
 
-					result.Service.Details.ProbeName = probe.Name
-					result.Service.Details.ProbeData = probe.Data
-					result.Service.Details.MatchMatched = match.Pattern
-
-					result.Service.Protocol = strings.ToLower(probe.Protocol)
-					result.Service.Name = match.Service
-
-					result.Banner = string(response)
-					result.BannerBytes = response
-					result.Service.Extras = extras
-
-					result.Timestamp = int32(time.Now().Unix())
-
-					found = true
-
-					return result, nil
-				} else
-				// soft 匹配，记录结果
-				if matched && match.IsSoft && !softFound {
-					Info("Soft matched:", match.Service, ", pattern:", match.Pattern)
-					softFound = true
-					softMatch = match
-				}
-			}
-
-			// 当前 Probe 下的 Matchs 未匹配成功，使用 Fallback Probe 中的 Matchs 进行尝试
-			fallback := probe.Fallback
-			if _, ok := v.ProbesMapKName[fallback]; ok {
-				fbProbe := v.ProbesMapKName[fallback]
-				for _, match := range *fbProbe.Matchs {
-					matched := match.MatchPattern(response)
-					if matched && !match.IsSoft {
-						extras := match.ParseVersionInfo(response)
-
-						result.Service.Target = target
-
-						result.Service.Details.ProbeName = probe.Name
-						result.Service.Details.ProbeData = probe.Data
-						result.Service.Details.MatchMatched = match.Pattern
-
-						result.Service.Protocol = strings.ToLower(probe.Protocol)
-						result.Service.Name = match.Service
-
-						result.Banner = string(response)
-						result.BannerBytes = response
-						result.Service.Extras = extras
-
-						result.Timestamp = int32(time.Now().Unix())
-
-						found = true
-
-						return result, nil
-					} else
-					// soft 匹配，记录结果
-					if matched && match.IsSoft && !softFound {
-						Info("Soft fallback matched:", match.Service, ", pattern:", match.Pattern)
-						softFound = true
-						softMatch = match
-					}
-				}
-			}
-
-			if !found {
-				if !softFound {
-					result.Service.Target = target
-					result.Service.Protocol = strings.ToLower(probe.Protocol)
-
-					result.Service.Details.ProbeName = probe.Name
-					result.Service.Details.ProbeData = probe.Data
-
-					result.Banner = string(response)
-					result.BannerBytes = response
-					result.Service.Name = "unknown"
-
-					result.Timestamp = int32(time.Now().Unix())
-
-					return result, nil
-				} else {
-					result.Service.Target = target
-					result.Service.Protocol = strings.ToLower(probe.Protocol)
-					result.Service.Details.ProbeName = probe.Name
-					result.Service.Details.ProbeData = probe.Data
-					result.Service.Details.MatchMatched = softMatch.Pattern
-					result.Service.Details.IsSoftMatched = true
-
-					result.Banner = string(response)
-					result.BannerBytes = response
-
-					result.Timestamp = int32(time.Now().Unix())
-
-					extras := softMatch.ParseVersionInfo(response)
-					result.Service.Extras = extras
-					result.Service.Name = softMatch.Service
-
-					return result, nil
-				}
+				return result, found, softFound, softMatch, response, nil
+			} else
+			// soft 匹配，记录结果
+			if matched && match.IsSoft && !softFound {
+				Info("Soft matched:", match.Service, ", pattern:", match.Pattern)
+				softFound = true
+				softMatch = match
 			}
 		}
 	}
+	return result, found, softFound, softMatch, response, nil
+}
 
-	return result, emptyResponse
+func (v *VScan) scanWithProbes(target Target, probes *[]Probe, config *Config) (Result, error) {
+	var err error
+	var result = Result{Target: target}
+	Debug("Scan probes:", probes)
+	for _, probe := range *probes {
+		var found bool
+		var softFound bool
+		var softMatch Match
+		var response []byte
+		// 探测目标端口函数，返回探测结果和错误信息
+		Debug("数据: %s", string(probe.DecodedData))
+		result, found, softFound, softMatch, response, err = v.getWithProbes(target, config, probe.DecodedData, probe.Name, probe.Data, probe.Matchs, probe.Protocol)
+		fallback := probe.Fallback
+		if err != nil && fallback == "" {
+			//return result, err
+			continue
+		}
+		// found 为 true 时，表示匹配到了规则，这里做一个判断
+		if !found {
+			if fallback != "" {
+				// 未匹配到规则，但存在 fallback，进行 fallback 探测
+				if _, ok := v.ProbesMapKName[fallback]; ok {
+					fbProbe := v.ProbesMapKName[fallback] //取出 fallback 探针
+					// 递归一下
+					result, _ = v.scanWithProbes(target, &[]Probe{fbProbe}, config)
+					if result.Service.Name != "unknown" {
+						return result, nil
+					}
+				}
+			}
+			// 当没有规则继续匹配时，存在报错直接返回错误
+			if !softFound {
+				result.Service.Target = target
+				result.Service.Protocol = strings.ToLower(probe.Protocol)
+
+				result.Service.Details.ProbeName = probe.Name
+				result.Service.Details.ProbeData = probe.Data
+
+				result.Banner = string(response)
+				result.BannerBytes = response
+				result.Service.Name = "unknown"
+
+				result.Timestamp = int32(time.Now().Unix())
+
+				return result, nil
+			} else {
+				result.Service.Target = target
+				result.Service.Protocol = strings.ToLower(probe.Protocol)
+				result.Service.Details.ProbeName = probe.Name
+				result.Service.Details.ProbeData = probe.Data
+				result.Service.Details.MatchMatched = softMatch.Pattern
+				result.Service.Details.IsSoftMatched = true
+
+				result.Banner = string(response)
+				result.BannerBytes = response
+
+				result.Timestamp = int32(time.Now().Unix())
+
+				extras := softMatch.ParseVersionInfo(response)
+				result.Service.Extras = extras
+				result.Service.Name = softMatch.Service
+
+				return result, nil
+			}
+		}
+	}
+	return result, nil
 }
 
 func grabResponse(target Target, data []byte, config *Config) ([]byte, error) {
@@ -931,13 +986,17 @@ func grabResponse(target Target, data []byte, config *Config) ([]byte, error) {
 	if !(proto == "tcp" || proto == "udp") {
 		log.Fatal("Failed to send request with unknown protocol", proto)
 	}
-
+	//if strings.Index(addr, "[") != -1 {
+	//	proto = "tcp6"
+	//}
 	conn, errConn := dialer.Dial(proto, addr)
 	if errConn != nil {
+		Debug("%v", errConn)
 		return response, errConn
 	}
+	Debug("连接成功")
 	defer conn.Close()
-
+	conn.SetDeadline(time.Now().Add(config.SendTimeout))
 	if len(data) > 0 {
 		conn.SetWriteDeadline(time.Now().Add(config.SendTimeout))
 		_, errWrite := conn.Write(data)
@@ -945,7 +1004,7 @@ func grabResponse(target Target, data []byte, config *Config) ([]byte, error) {
 			return response, errWrite
 		}
 	}
-
+	conn.SetDeadline(time.Now().Add(config.ReadTimeout))
 	conn.SetReadDeadline(time.Now().Add(config.ReadTimeout))
 	for true {
 		buff := make([]byte, 1024)
@@ -1036,6 +1095,7 @@ func (w *Worker) Start(v *VScan, wg *sync.WaitGroup) {
 			}
 			result, err := v.Explore(target, w.Config)
 			if err != nil {
+				Debug("Error:", err)
 				continue
 			}
 			if err == emptyResponse {
@@ -1049,7 +1109,10 @@ func (w *Worker) Start(v *VScan, wg *sync.WaitGroup) {
 
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
-
+	go func() {
+		time.Sleep(time.Duration(3) * time.Minute) //临时解决线程卡死无法退出的玄学问题  TODO 增加超时限制
+		os.Exit(0)
+	}()
 	// 初始化 VScan 实例，并加载默认 nmap-service-probes 文件解析 Probe 列表
 	v := VScan{}
 	v.Init(scanProbeFile)
@@ -1064,7 +1127,6 @@ func main() {
 	// 最大协程并发量为参数 routines
 	wgWorkers := sync.WaitGroup{}
 	wgWorkers.Add(int(routines))
-
 	// 启动协程并开始监听处理输入的 Target
 	for i := 0; i < routines; i++ {
 		worker := Worker{inTargetChan, outResultChan, &config}
@@ -1075,9 +1137,10 @@ func main() {
 	wgOutput := sync.WaitGroup{}
 	wgOutput.Add(1)
 	go func(wg *sync.WaitGroup) {
+
 		for {
 			result, ok := <-outResultChan
-			if ok {
+			if ok && result.Banner != "" {
 				// 对获取到的 Result 进行判断，如果含有 Error 信息则进行筛选输出
 				encodeJSON, err := json.Marshal(result)
 				if err != nil {
@@ -1097,33 +1160,48 @@ func main() {
 	for {
 		line, err := reader.ReadString('\n')
 		if err == io.EOF {
-			log.Println("EOF")
+			Debug("EOF")
 			break
 		}
 		line = strings.TrimSpace(line)
+		//fmt.Println(line)
 		if len(line) == 0 {
-			continue
+			//continue
 		} else {
 			// 解析输入格式
 			//  >> {IP}:{PORT}(/(tcp)|(udp))?
-
-			finds := targetRegexp.FindStringSubmatch(line)
-			if len(finds) > 0 {
-
-			} else {
-				Error("Wrong input target format, ", line)
-				continue
-			}
-
-			ip := finds[1]
-			port := finds[2]
-			protocol := finds[3]
-			if !(protocol == "tcp" || protocol == "udp") {
-				// 默认使用 tcp
+			//IPV6  [1:::]:80
+			ip := ""
+			port := ""
+			protocol := ""
+			if strings.Index(line, "[") != -1 {
+				addr := strings.Split(line, "]:")
+				if len(addr) != 2 {
+					continue
+				}
+				ip = addr[0] + "]"
+				port = addr[1]
 				protocol = "tcp"
-			}
+			} else {
+				finds := targetRegexp.FindStringSubmatch(line)
+				if len(finds) > 0 {
 
+				} else {
+					Error("Wrong input target format, ", line)
+					//continue
+				}
+
+				ip = finds[1]
+				port = finds[2]
+				protocol = finds[3]
+				if !(protocol == "tcp" || protocol == "udp") {
+					// 默认使用 tcp
+					protocol = "tcp"
+				}
+			}
 			// fmt.Println(len(finds), finds)
+
+			Debug("Target: ", ip, port, protocol)
 
 			portNum, _ := strconv.Atoi(port)
 			target := Target{
@@ -1137,8 +1215,8 @@ func main() {
 	}
 	close(inTargetChan)
 	wgWorkers.Wait()
-	log.Println("All workers exited")
+	Debug("All workers exited")
 	close(outResultChan)
-	log.Println("Output goroutine finished")
+	Debug("Output goroutine finished")
 	wgOutput.Wait()
 }
